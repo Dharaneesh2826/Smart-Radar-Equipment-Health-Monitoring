@@ -180,33 +180,6 @@ The project can be further improved through:
 
 **Note:** This project is a prototype for supplementary equipment-condition monitoring. It is not a replacement for certified defence equipment diagnostics, safety systems, or existing radar monitoring mechanisms.
 
-## 📁 Repository Structure
-
-```text
-Smart-Radar-Equipment-Health-Monitoring/
-│
-├── README.md
-│
-├── 01_Source_Code/
-│   └── ESP32_Firmware.py
-│
-├── 02_Circuit_Diagrams/
-│   └── Circuit_Diagram.png
-│
-├── 03_Project_Images/
-│   ├── Hardware_Setup.jpg
-│   └── Sensor_Connections.jpg
-│
-├── 04_Dashboard/
-│   └── Dashboard_Files/
-│
-├── 05_Documentation/
-│   └── Project_Report.pdf
-│
-└── 06_Presentation/
-    └── Project_Presentation.pptx
-```
-
 *The filenames above are examples. Update this structure to match the files actually included in your repository.*
 
 ## 🔧 Installation and Setup
