@@ -1,0 +1,741 @@
+# =====================================================================
+# Smart Radar Enclosure Monitor — ESP32 MicroPython
+# DHT22/DHT11 + MQ2 gas sensor + simulated vibration for demonstration
+# Dashboard hosted by ESP32 — no Flask, OLED, or MPU6050 required
+# =====================================================================
+
+import network, socket, json, time, dht, gc, random
+import uasyncio as asyncio
+from machine import Pin, ADC
+
+try:
+    import urequests as requests
+except ImportError:
+    import requests
+
+# ------------------------------ SETTINGS ------------------------------
+WIFI_SSID = "XXXX"
+WIFI_PASSWORD = "XXXX"
+TG_TOKEN = "XXXX"
+TG_CHAT_ID = "XXXX"
+
+PUBLIC_DASHBOARD_URL = ""
+DEVICE_NAME = "Radar Enclosure Monitor"
+SENSOR_TYPE = "DHT22"
+
+TELEMETRY_INTERVAL_S = 30
+ALERT_REPEAT_S = 300
+READ_MS = 2000
+MQ2_WARMUP_S = 30
+NORMAL_CONFIRM_READS = 2
+
+TEMP_WARN = 20
+TEMP_CRIT = 60.0
+VIB_WARN = 0.10
+VIB_CRIT = 0.50
+GAS_DELTA_CRIT = 500
+
+# DHT data, MQ2 analogue, buzzer, green LED, red LED
+PIN_DHT, PIN_MQ2, PIN_BUZZER, PIN_GREEN, PIN_RED = 4, 34, 25, 26, 27
+
+# ------------------------------ HARDWARE ------------------------------
+green = Pin(PIN_GREEN, Pin.OUT, value=0)
+red = Pin(PIN_RED, Pin.OUT, value=0)
+buzzer = Pin(PIN_BUZZER, Pin.OUT, value=0)
+
+mq2 = ADC(Pin(PIN_MQ2))
+mq2.atten(ADC.ATTN_11DB)
+
+if SENSOR_TYPE == "DHT11":
+    dht_sensor = dht.DHT11(Pin(PIN_DHT))
+else:
+    dht_sensor = dht.DHT22(Pin(PIN_DHT))
+
+wlan = network.WLAN(network.STA_IF)
+start_ms = time.ticks_ms()
+
+dashboard = {
+    "device": DEVICE_NAME,
+    "status": "WARMUP",
+    "reason": "MQ2 baseline warming up",
+    "temp": None,
+    "hum": None,
+    "vib": 0.0,
+    "vib_source": "SIMULATED",
+    "gas_raw": 0,
+    "gas_rise": 0,
+    "gas_baseline": 0,
+    "sensor_ok": True,
+    "wifi": False,
+    "ip": "--",
+    "rssi": None,
+    "uptime": "00:00:00",
+    "last_updated": "Waiting for first sample"
+}
+
+# ------------------------------- HELPERS ------------------------------
+def uptime():
+    seconds = time.ticks_diff(time.ticks_ms(), start_ms) // 1000
+    return "%02d:%02d:%02d" % (
+        seconds // 3600,
+        (seconds % 3600) // 60,
+        seconds % 60
+    )
+
+def safe_rssi():
+    try:
+        return wlan.status("rssi") if wlan.isconnected() else None
+    except Exception:
+        return None
+
+def dashboard_url():
+    if PUBLIC_DASHBOARD_URL.strip():
+        return PUBLIC_DASHBOARD_URL.strip()
+    return "http://%s" % dashboard["ip"]
+
+# ---------------------------- WIFI CONNECTION -------------------------
+def wifi_connect():
+    if wlan.isconnected():
+        dashboard["wifi"] = True
+        dashboard["ip"] = wlan.ifconfig()[0]
+        return True
+
+    # Fixes ESP32 "Wifi Internal State Error" after a soft reboot.
+    for attempt in range(1, 4):
+        try:
+            wlan.active(False)
+        except Exception:
+            pass
+
+        time.sleep_ms(500)
+
+        try:
+            wlan.active(True)
+            time.sleep_ms(500)
+
+            try:
+                wlan.disconnect()
+            except Exception:
+                pass
+
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+
+            started = time.ticks_ms()
+            while not wlan.isconnected():
+                if time.ticks_diff(time.ticks_ms(), started) > 12000:
+                    break
+                time.sleep_ms(250)
+
+            if wlan.isconnected():
+                dashboard["wifi"] = True
+                dashboard["ip"] = wlan.ifconfig()[0]
+                print("Wi-Fi connected:", dashboard["ip"])
+                return True
+
+            print("Wi-Fi attempt %d timed out" % attempt)
+
+        except Exception as error:
+            print("Wi-Fi attempt %d failed: %s" % (attempt, error))
+
+    dashboard["wifi"] = False
+    dashboard["ip"] = "--"
+    return False
+
+# ------------------------------ SENSORS -------------------------------
+def read_gas():
+    total = 0
+
+    for _ in range(16):
+        total += mq2.read()
+        time.sleep_ms(2)
+
+    return total // 16
+
+def random_noise():
+    try:
+        return (random.getrandbits(12) / 4095.0 - 0.5) * 0.012
+    except AttributeError:
+        return ((time.ticks_ms() % 1000) / 1000.0 - 0.5) * 0.012
+
+def read_simulated_vibration(temp):
+    # Demo-only value — not a physical vibration measurement.
+    if temp is None:
+        return 0.0
+
+    if temp >= TEMP_WARN:
+        span = max(1.0, TEMP_CRIT - TEMP_WARN)
+        progress = min(1.0, (temp - TEMP_WARN) / span)
+
+        # Above warning level at 40 C; above critical near 60 C.
+        vibration = VIB_WARN + 0.015
+        vibration += progress * (VIB_CRIT - VIB_WARN + 0.040)
+    else:
+        vibration = 0.015
+
+    return max(0.0, vibration + random_noise())
+
+# ----------------------------- STATE LOGIC ----------------------------
+def classify(temp, gas_rise, vibration):
+    if gas_rise >= GAS_DELTA_CRIT:
+        return "CRITICAL"
+
+    if temp >= TEMP_CRIT or vibration >= VIB_CRIT:
+        return "CRITICAL"
+
+    if temp >= TEMP_WARN or vibration >= VIB_WARN:
+        return "DEGRADED"
+
+    return "NORMAL"
+
+def status_reason(temp, gas_rise, vibration, status):
+    if status == "WARMUP":
+        return "MQ2 baseline warming up"
+
+    if status == "SENSOR_FAULT":
+        return "DHT sensor read failure"
+
+    reasons = []
+
+    if gas_rise >= GAS_DELTA_CRIT:
+        reasons.append("gas increase")
+
+    if temp is not None and temp >= TEMP_CRIT:
+        reasons.append("critical temperature")
+    elif temp is not None and temp >= TEMP_WARN:
+        reasons.append("high temperature")
+
+    if vibration >= VIB_CRIT:
+        reasons.append("critical simulated vibration")
+    elif vibration >= VIB_WARN:
+        reasons.append("simulated vibration")
+
+    if reasons:
+        return ", ".join(reasons)
+
+    return "all readings are within limits"
+
+def drive_outputs(status, now):
+    if status == "NORMAL":
+        green.value(1)
+        red.value(0)
+        buzzer.value(0)
+
+    elif status == "DEGRADED":
+        green.value(0)
+        red.value(1)
+        buzzer.value(1)
+
+    elif status == "CRITICAL":
+        on = (now // 100) % 2 == 0
+        green.value(0)
+        red.value(on)
+        buzzer.value(on)
+
+    elif status == "WARMUP":
+        on = (now // 500) % 2 == 0
+        green.value(on)
+        red.value(on)
+        buzzer.value(0)
+
+    else:
+        green.value(0)
+        red.value(1)
+        buzzer.value(0)
+
+# ------------------------------ TELEGRAM ------------------------------
+last_tg_failure = None
+alert_rank = 0
+last_alert_ms = 0
+
+RANK = {
+    "NORMAL": 0,
+    "WARMUP": 0,
+    "DEGRADED": 1,
+    "SENSOR_FAULT": 1,
+    "CRITICAL": 2
+}
+
+def url_encode(value):
+    encoded = []
+
+    for byte in str(value).encode("utf-8"):
+        char = chr(byte)
+
+        if (char.isalpha() and byte < 128) or char.isdigit() or char in "-_.~":
+            encoded.append(char)
+        else:
+            encoded.append("%%%02X" % byte)
+
+    return "".join(encoded)
+
+def telegram_ready():
+    return (
+        wlan.isconnected()
+        and TG_TOKEN
+        and TG_CHAT_ID
+        and "YOUR_" not in TG_TOKEN
+        and "YOUR_" not in TG_CHAT_ID
+    )
+
+def tg_send(message):
+    global last_tg_failure
+
+    if not telegram_ready():
+        return False
+
+    if last_tg_failure is not None:
+        if time.ticks_diff(time.ticks_ms(), last_tg_failure) < 20000:
+            return False
+
+    url = (
+        "https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s"
+        % (TG_TOKEN, url_encode(TG_CHAT_ID), url_encode(message))
+    )
+
+    response = None
+
+    try:
+        gc.collect()
+        response = requests.get(url)
+
+        if response.status_code == 200:
+            last_tg_failure = None
+            return True
+
+        print("Telegram error:", response.status_code)
+
+    except Exception as error:
+        print("Telegram send failed:", error)
+
+    finally:
+        if response:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+        gc.collect()
+
+    last_tg_failure = time.ticks_ms()
+    return False
+
+def snapshot_message(prefix="LIVE READING"):
+    s = dashboard
+
+    temperature = "--" if s["temp"] is None else "%.1f C" % s["temp"]
+    humidity = "--" if s["hum"] is None else "%d %%" % s["hum"]
+
+    return (
+        "%s\n%s: %s\nReason: %s\n\n"
+        "Temperature: %s\n"
+        "Humidity: %s\n"
+        "Vibration: %.3f g [SIMULATED]\n"
+        "Gas sensor: %d (rise +%d)\n\n"
+        "Dashboard:\n%s"
+        % (
+            prefix,
+            DEVICE_NAME,
+            s["status"],
+            s["reason"],
+            temperature,
+            humidity,
+            s["vib"],
+            s["gas_raw"],
+            s["gas_rise"],
+            dashboard_url()
+        )
+    )
+
+def maybe_alert(now):
+    global alert_rank, last_alert_ms
+
+    status = dashboard["status"]
+    rank = RANK.get(status, 0)
+
+    if status == "WARMUP":
+        return
+
+    if rank > alert_rank:
+        if tg_send(snapshot_message("ALERT")):
+            alert_rank = rank
+            last_alert_ms = now
+
+    elif rank > 0 and rank == alert_rank:
+        if time.ticks_diff(now, last_alert_ms) >= ALERT_REPEAT_S * 1000:
+            if tg_send(snapshot_message("ALERT STILL ACTIVE")):
+                last_alert_ms = now
+
+    elif 0 < rank < alert_rank:
+        alert_rank = rank
+
+    elif rank == 0 and alert_rank > 0:
+        if tg_send(snapshot_message("RECOVERED")):
+            alert_rank = 0
+
+# --------------------------- HTML DASHBOARD ---------------------------
+def build_html():
+    return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radar Enclosure Monitor</title>
+
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:#08101e;color:#e9f2ff;
+font-family:Arial,sans-serif;padding:18px}
+.wrap{max-width:980px;margin:auto}
+.top{display:flex;justify-content:space-between;gap:14px;align-items:center;
+border-bottom:1px solid #273750;padding-bottom:18px;margin-bottom:16px}
+.brand{font-weight:800;font-size:20px}
+.sub,.label,.meta{color:#91a4bf;font-size:12px}
+.live{color:#57e8ac;font-weight:bold;font-size:13px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;
+background:#57e8ac;box-shadow:0 0 12px #57e8ac;margin-right:6px}
+.state{border:1px solid #30415e;border-radius:16px;padding:22px;
+text-align:center;background:#101b30;margin-bottom:14px}
+.state h1{margin:7px 0;font-size:34px;letter-spacing:2px}
+.state p{margin:0;color:#bdcadc}
+.state-normal{color:#57e8ac}
+.state-warmup{color:#f6c85f}
+.state-degraded{color:#ffad4c}
+.state-critical{color:#ff5e70}
+.state-sensor_fault{color:#ff5e70}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.card{border:1px solid #283b59;border-radius:14px;background:#101b30;
+padding:16px;min-height:128px}
+.value{font-size:29px;font-weight:800;margin-top:12px}
+.unit{font-size:13px;color:#91a4bf;font-weight:normal}
+.sim{color:#f6c85f;font-size:10px;font-weight:bold;margin-top:6px}
+.bar{height:7px;border-radius:8px;background:#23344f;margin-top:14px;
+overflow:hidden}
+.fill{height:100%;border-radius:8px;transition:width .4s}
+.details{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+.row{display:flex;justify-content:space-between;border-bottom:1px solid #243651;
+padding:11px 0}
+.row:last-child{border:0}
+@media(max-width:720px){
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .details{grid-template-columns:1fr}
+  .top{align-items:flex-start;flex-direction:column}
+}
+@media(max-width:390px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+
+<body>
+<main class="wrap">
+<header class="top">
+  <div>
+    <div class="brand">RADAR ENCLOSURE MONITOR</div>
+    <div class="sub">ESP32 LOCAL LIVE DASHBOARD</div>
+  </div>
+  <div>
+    <span class="dot"></span><span class="live">LIVE</span>
+    <div class="meta" id="updated">Connecting...</div>
+  </div>
+</header>
+
+<section class="state">
+  <div class="label">SYSTEM STATE</div>
+  <h1 id="status">--</h1>
+  <p id="reason">Waiting for sensor data</p>
+</section>
+
+<section class="grid">
+  <article class="card">
+    <div class="label">TEMPERATURE</div>
+    <div class="value" id="temp">-- <span class="unit">C</span></div>
+    <div class="bar"><div class="fill" id="tempBar"></div></div>
+  </article>
+
+  <article class="card">
+    <div class="label">HUMIDITY</div>
+    <div class="value" id="hum">-- <span class="unit">%</span></div>
+    <div class="bar"><div class="fill" id="humBar"></div></div>
+  </article>
+
+  <article class="card">
+    <div class="label">VIBRATION</div>
+    <div class="value" id="vib">-- <span class="unit">g RMS</span></div>
+    <div class="sim">SIMULATED — TEMPERATURE LINKED</div>
+    <div class="bar"><div class="fill" id="vibBar"></div></div>
+  </article>
+
+  <article class="card">
+    <div class="label">GAS SENSOR</div>
+    <div class="value" id="gas">-- <span class="unit">ADC</span></div>
+    <div class="bar"><div class="fill" id="gasBar"></div></div>
+  </article>
+</section>
+
+<section class="details">
+  <article class="card">
+    <div class="label">DEVICE & NETWORK</div>
+    <div class="row"><span>Device</span><b id="device">--</b></div>
+    <div class="row"><span>ESP32 IP</span><b id="ip">--</b></div>
+    <div class="row"><span>Wi-Fi signal</span><b id="wifi">--</b></div>
+  </article>
+
+  <article class="card">
+    <div class="label">SENSOR DETAILS</div>
+    <div class="row"><span>Vibration source</span><b>SIMULATED</b></div>
+    <div class="row"><span>Gas increase</span><b id="rise">--</b></div>
+    <div class="row"><span>Gas baseline</span><b id="baseline">--</b></div>
+    <div class="row"><span>Uptime</span><b id="uptime">--</b></div>
+  </article>
+</section>
+</main>
+
+<script>
+const el = id => document.getElementById(id);
+
+function value(x, decimals = 1) {
+  return x == null ? "--" : Number(x).toFixed(decimals);
+}
+
+function setBar(id, number, maximum, color) {
+  const element = el(id);
+  element.style.width = Math.max(0, Math.min(100, number / maximum * 100)) + "%";
+  element.style.background = color;
+}
+
+function update(s) {
+  const state = String(s.status || "--");
+  const status = el("status");
+
+  status.textContent = state;
+  status.className = "state-" + state.toLowerCase();
+
+  el("reason").textContent = s.reason || "--";
+  el("temp").innerHTML = value(s.temp) + ' <span class="unit">C</span>';
+  el("hum").innerHTML = value(s.hum, 0) + ' <span class="unit">%</span>';
+  el("vib").innerHTML = value(s.vib, 3) + ' <span class="unit">g RMS</span>';
+  el("gas").innerHTML = (s.gas_raw == null ? "--" : s.gas_raw) +
+                        ' <span class="unit">ADC</span>';
+
+  setBar("tempBar", s.temp || 0, 70, "#ffad4c");
+  setBar("humBar", s.hum || 0, 100, "#4ca3ff");
+  setBar("vibBar", s.vib || 0, 0.6, s.vib >= 0.5 ? "#ff5e70" : "#b582ff");
+  setBar("gasBar", s.gas_rise || 0, 500, s.gas_rise >= 500 ? "#ff5e70" : "#57e8ac");
+
+  el("device").textContent = s.device || "--";
+  el("ip").textContent = s.ip || "--";
+  el("wifi").textContent = s.rssi == null
+    ? (s.wifi ? "Connected" : "Offline")
+    : s.rssi + " dBm";
+
+  el("rise").textContent = "+" + (s.gas_rise == null ? "--" : s.gas_rise);
+  el("baseline").textContent = s.gas_baseline == null ? "--" : s.gas_baseline;
+  el("uptime").textContent = s.uptime || "--";
+  el("updated").textContent = "Updated " + (s.last_updated || "--");
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("/api", {cache: "no-store"});
+    update(await response.json());
+  } catch (error) {
+    el("updated").textContent = "Dashboard connection lost";
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>"""
+
+# ----------------------------- WEB SERVER -----------------------------
+def api_json():
+    dashboard["uptime"] = uptime()
+    dashboard["wifi"] = wlan.isconnected()
+    dashboard["rssi"] = safe_rssi()
+    return json.dumps(dashboard)
+
+def send_bytes(connection, data):
+    position = 0
+
+    while position < len(data):
+        sent = connection.send(data[position:])
+
+        if sent is None or sent <= 0:
+            raise OSError("Socket closed during send")
+
+        position += sent
+
+async def web_server_task():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("", 80))
+    server.listen(3)
+    server.setblocking(False)
+
+    print("Dashboard ready at", dashboard_url())
+
+    while True:
+        connection = None
+
+        try:
+            connection, _ = server.accept()
+            connection.settimeout(1)
+
+            request = connection.recv(512).decode("utf-8", "ignore")
+            is_api = request.startswith("GET /api")
+
+            body = api_json() if is_api else build_html()
+            content_type = "application/json" if is_api else "text/html; charset=utf-8"
+
+            payload = body.encode("utf-8")
+            header = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: %s\r\n"
+                "Cache-Control: no-store\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n\r\n"
+                % (content_type, len(payload))
+            ).encode()
+
+            send_bytes(connection, header)
+            send_bytes(connection, payload)
+
+        except OSError:
+            pass
+
+        except Exception as error:
+            print("Web server error:", error)
+
+        finally:
+            if connection:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+        await asyncio.sleep_ms(25)
+
+# ----------------------------- MONITOR TASK ---------------------------
+async def monitor_task():
+    baseline = 0
+    warm_samples = []
+
+    pending = 0
+    dht_errors = 0
+    status = "WARMUP"
+
+    last_wifi_retry = 0
+    last_telemetry = time.ticks_ms()
+
+    while True:
+        now = time.ticks_ms()
+
+        if not wlan.isconnected():
+            if time.ticks_diff(now, last_wifi_retry) >= 10000:
+                last_wifi_retry = now
+                wifi_connect()
+
+        try:
+            dht_sensor.measure()
+            temp = dht_sensor.temperature()
+            hum = dht_sensor.humidity()
+
+            dht_errors = 0
+            sensor_ok = True
+
+        except OSError:
+            dht_errors += 1
+            temp = None
+            hum = None
+            sensor_ok = dht_errors < 3
+
+        gas_raw = read_gas()
+
+        warming = time.ticks_diff(now, start_ms) < MQ2_WARMUP_S * 1000
+
+        if warming:
+            warm_samples = (warm_samples + [gas_raw])[-10:]
+            gas_rise = 0
+        else:
+            if baseline == 0:
+                baseline = sum(warm_samples) // max(1, len(warm_samples))
+                print("MQ2 baseline:", baseline)
+
+            gas_rise = max(0, gas_raw - baseline)
+
+        vibration = read_simulated_vibration(temp)
+
+        if temp is None:
+            candidate = "NORMAL"
+        else:
+            candidate = classify(temp, gas_rise, vibration)
+
+        if not sensor_ok and candidate == "NORMAL":
+            candidate = "SENSOR_FAULT"
+
+        if warming and candidate == "NORMAL":
+            candidate = "WARMUP"
+
+        # Critical is immediate. Other state changes need two readings.
+        if candidate == status:
+            pending = 0
+
+        elif candidate == "CRITICAL" or status == "WARMUP":
+            status = candidate
+            pending = 0
+
+        else:
+            pending += 1
+
+            if pending >= NORMAL_CONFIRM_READS:
+                status = candidate
+                pending = 0
+
+        dashboard.update({
+            "status": status,
+            "reason": status_reason(temp, gas_rise, vibration, status),
+            "temp": temp,
+            "hum": hum,
+            "vib": vibration,
+            "vib_source": "SIMULATED",
+            "gas_raw": gas_raw,
+            "gas_rise": gas_rise,
+            "gas_baseline": baseline,
+            "sensor_ok": sensor_ok,
+            "wifi": wlan.isconnected(),
+            "ip": wlan.ifconfig()[0] if wlan.isconnected() else "--",
+            "rssi": safe_rssi(),
+            "uptime": uptime(),
+            "last_updated": uptime()
+        })
+
+        drive_outputs(status, now)
+
+        print(
+            "T=%s H=%s V=%.3f(SIM) gas=%d(+%d) => %s"
+            % (temp, hum, vibration, gas_raw, gas_rise, status)
+        )
+
+        maybe_alert(now)
+
+        if time.ticks_diff(now, last_telemetry) >= TELEMETRY_INTERVAL_S * 1000:
+            last_telemetry = now
+            tg_send(snapshot_message("30-SECOND LIVE READING"))
+
+        await asyncio.sleep_ms(READ_MS)
+
+# ------------------------------- START --------------------------------
+async def main():
+    print("Starting", DEVICE_NAME, "with simulated vibration")
+
+    wifi_connect()
+
+    if wlan.isconnected():
+        tg_send("%s is online.\nDashboard:\n%s" % (DEVICE_NAME, dashboard_url()))
+
+    await asyncio.gather(
+        monitor_task(),
+        web_server_task()
+    )
+
+asyncio.run(main())
